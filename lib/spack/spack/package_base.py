@@ -14,7 +14,6 @@ import copy
 import functools
 import glob
 import hashlib
-import importlib
 import io
 import os
 import re
@@ -24,11 +23,11 @@ import time
 import traceback
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Type, TypeVar, Union
 
-from typing_extensions import Literal
+from _vendoring.typing_extensions import Literal
 
 import llnl.util.filesystem as fsys
 import llnl.util.tty as tty
-from llnl.util.lang import classproperty, memoized
+from llnl.util.lang import ClassProperty, classproperty, memoized
 
 import spack.config
 import spack.dependency
@@ -48,6 +47,7 @@ import spack.store
 import spack.url
 import spack.util.environment
 import spack.util.executable
+import spack.util.naming
 import spack.util.path
 import spack.util.web
 import spack.variant
@@ -80,6 +80,8 @@ _spack_configure_argsfile = "spack-configure-args.txt"
 
 #: Filename of json with total build and phase times (seconds)
 spack_times_log = "install_times.json"
+
+NO_DEFAULT = object()
 
 
 class WindowsRPath:
@@ -583,7 +585,7 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
     like ``homepage`` and, for a code-based package, ``url``, or functions
     such as ``install()``.
     There are many custom ``Package`` subclasses in the
-    ``spack.build_systems`` package that make things even easier for
+    ``spack_repo.builtin.build_systems`` package that make things even easier for
     specific build systems.
 
     """
@@ -701,10 +703,10 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
     _verbose = None
 
     #: Package homepage where users can find more information about the package
-    homepage: Optional[str] = None
+    homepage: ClassProperty[Optional[str]] = None
 
     #: Default list URL (place to find available versions)
-    list_url: Optional[str] = None
+    list_url: ClassProperty[Optional[str]] = None
 
     #: Link depth to which list_url should be searched for new versions
     list_depth = 0
@@ -818,12 +820,12 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
 
     @classproperty
     def module(cls):
-        """Module object (not just the name) that this package is defined in.
+        """Module instance that this package class is defined in.
 
         We use this to add variables to package modules.  This makes
         install() methods easier to write (e.g., can call configure())
         """
-        return importlib.import_module(cls.__module__)
+        return sys.modules[cls.__module__]
 
     @classproperty
     def namespace(cls):
@@ -839,26 +841,36 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
     def fullnames(cls):
         """Fullnames for this package and any packages from which it inherits."""
         fullnames = []
-        for cls in cls.__mro__:
-            namespace = getattr(cls, "namespace", None)
-            if namespace:
-                fullnames.append("%s.%s" % (namespace, cls.name))
-            if namespace == "builtin":
-                # builtin packages cannot inherit from other repos
+        for base in cls.__mro__:
+            if not spack.repo.is_package_module(base.__module__):
                 break
+            fullnames.append(base.fullname)
         return fullnames
 
     @classproperty
     def name(cls):
-        """The name of this package.
-
-        The name of a package is the name of its Python module, without
-        the containing module names.
-        """
+        """The name of this package."""
         if cls._name is None:
-            cls._name = cls.module.__name__
-            if "." in cls._name:
-                cls._name = cls._name[cls._name.rindex(".") + 1 :]
+            # We cannot know the exact package API version, but we can distinguish between v1
+            # v2 based on the module. We don't want to figure out the exact package API version
+            # since it requires parsing the repo.yaml.
+            module = cls.__module__
+
+            if module.startswith(spack.repo.PKG_MODULE_PREFIX_V1):
+                version = (1, 0)
+            elif module.startswith(spack.repo.PKG_MODULE_PREFIX_V2):
+                version = (2, 0)
+            else:
+                raise ValueError(f"Package {cls.__qualname__} is not a known Spack package")
+
+            if version < (2, 0):
+                # spack.pkg.builtin.package_name.
+                _, _, pkg_module = module.rpartition(".")
+            else:
+                # spack_repo.builtin.packages.package_name.package
+                pkg_module = module.rsplit(".", 2)[-2]
+
+            cls._name = spack.util.naming.pkg_dir_to_pkg_name(pkg_module, version)
         return cls._name
 
     @classproperty
@@ -976,7 +988,9 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
         """
         return self._implement_all_urls_for_version(version)[0]
 
-    def update_external_dependencies(self, extendee_spec=None):
+    def _update_external_dependencies(
+        self, extendee_spec: Optional[spack.spec.Spec] = None
+    ) -> None:
         """
         Method to override in package classes to handle external dependencies
         """
@@ -990,6 +1004,41 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
         _, record = spack.store.STORE.db.query_by_spec_hash(self.spec.dag_hash())
         assert dev_path_var and record, "dev_path variant and record must be present"
         return fsys.recursive_mtime_greater_than(dev_path_var.value, record.installation_time)
+
+    @classmethod
+    def version_or_package_attr(cls, attr, version, default=NO_DEFAULT):
+        """
+        Get an attribute that could be on the version or package with preference to the version
+        """
+        version_attrs = cls.versions.get(version)
+        if version_attrs and attr in version_attrs:
+            return version_attrs.get(attr)
+        if default is NO_DEFAULT and not hasattr(cls, attr):
+            raise PackageError(f"{attr} attribute not defined on {cls.name}")
+        return getattr(cls, attr, default)
+
+    @classmethod
+    def needs_commit(cls, version) -> bool:
+        """
+        Method for checking if the package instance needs a commit sha to be found
+        """
+        if isinstance(version, GitVersion):
+            return True
+
+        ver_attrs = cls.versions.get(version)
+        if ver_attrs:
+            return bool(ver_attrs.get("commit") or ver_attrs.get("tag") or ver_attrs.get("branch"))
+
+        return False
+
+    def resolve_binary_provenance(self) -> None:
+        """
+        Method to ensure concrete spec has binary provenance.
+        Base implementation will look up git commits when appropriate.
+        Packages may override this implementation for custom implementations
+        """
+        # TODO in follow on PR adding here so SNL team can begin work ahead of spack core
+        pass
 
     def all_urls_for_version(self, version: StandardVersion) -> List[str]:
         """Return all URLs derived from version_urls(), url, urls, and
@@ -1355,14 +1404,16 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
         return [
             vspec
             for when_spec, provided in self.provided.items()
-            for vspec in provided
+            for vspec in sorted(provided)
             if self.spec.satisfies(when_spec)
         ]
 
     @classmethod
     def provided_virtual_names(cls):
         """Return sorted list of names of virtuals that can be provided by this package."""
-        return sorted(set(vpkg.name for virtuals in cls.provided.values() for vpkg in virtuals))
+        return sorted(
+            set(vpkg.name for virtuals in cls.provided.values() for vpkg in sorted(virtuals))
+        )
 
     @property
     def prefix(self):
@@ -1650,10 +1701,11 @@ class PackageBase(WindowsRPath, PackageViewMixin, metaclass=PackageMeta):
         if self.spec.versions.concrete:
             try:
                 source_id = fs.for_package_version(self).source_id()
-            except (fs.ExtrapolationError, fs.InvalidArgsError):
+            except (fs.ExtrapolationError, fs.InvalidArgsError, spack.error.NoURLError):
                 # ExtrapolationError happens if the package has no fetchers defined.
                 # InvalidArgsError happens when there are version directives with args,
                 #     but none of them identifies an actual fetcher.
+                # NoURLError happens if the package is external-only with no url
                 source_id = None
 
             if not source_id:
